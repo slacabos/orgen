@@ -1,4 +1,4 @@
-import { decodeBase64, imageMediaType, validateMp3 } from './media.js';
+import { decodeBase64, imageMediaType, referenceImageType, validateMp3 } from './media.js';
 
 const apiUrl = 'https://openrouter.ai/api/v1';
 const defaultImageModel = 'bytedance-seed/seedream-5-5';
@@ -116,10 +116,16 @@ export function createClient({ apiKey, fetchImpl = fetch } = {}) {
   }
 
   return {
-    async generateImage({ prompt, model = defaultImageModel, aspectRatio, resolution, background }) {
+    async generateImage({ prompt, model = defaultImageModel, aspectRatio, resolution, background, referenceImage }) {
       validatePrompt(prompt);
       validateImageOptions({ model, resolution, background });
       const transparent = background === 'transparent';
+      let inputReferences;
+      if (referenceImage !== undefined) {
+        const mediaType = referenceImageType(referenceImage);
+        const base64 = Buffer.from(referenceImage).toString('base64');
+        inputReferences = [{ type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } }];
+      }
       return request('images', {
         model,
         prompt,
@@ -128,6 +134,7 @@ export function createClient({ apiKey, fetchImpl = fetch } = {}) {
         resolution,
         background,
         output_format: transparent ? 'png' : undefined,
+        input_references: inputReferences,
       }, async (response) => {
         const result = await response.json().catch(() => {
           throw new Error('OpenRouter returned an invalid image response.');

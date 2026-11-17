@@ -1,10 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { link, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
 import { createClient, validateImageOptions } from './client.js';
-import { mediaExtensions } from './media.js';
+import { mediaExtensions, referenceImageType } from './media.js';
 import { createCredentialStore } from './windows-credentials.js';
 
 const commonOptions = {
@@ -12,6 +13,7 @@ const commonOptions = {
   output: { type: 'string', short: 'o' },
   json: { type: 'boolean' },
   'prompt-file': { type: 'string' },
+  batch: { type: 'string' },
 };
 const usd = new Intl.NumberFormat('en-US', {
   style: 'currency', currency: 'USD', maximumFractionDigits: 20,
@@ -24,27 +26,31 @@ const help = {
   auth     Manage the saved OpenRouter API key
 
 Run orgen <command> --help for options.`,
-  image: `Usage: orgen image ("<prompt>" | --prompt-file <path>) -o <path> [options]
+  image: `Usage: orgen image ("<prompt>" | --prompt-file <path> | --batch <path>) [options]
 
-  -o, --output <path>     Destination path
+  -o, --output <path>    Destination for one image (default: generated name in current directory)
   --prompt-file <path>   Read the prompt from a UTF-8 file
+  --batch <path>         Generate one image per job in a JSON manifest
   --json                 Print path, model, and cost as JSON
+  --reference <path>     Guide generation with a PNG, JPEG, or WebP image
   --model <id>           OpenRouter image model (default: bytedance-seed/seedream-5-5)
-  --aspect-ratio <ratio> Aspect ratio, for example 16:9
+  --aspect-ratio <ratio>  Aspect ratio, for example 16:9
   --resolution <tier>    1K, 1.5K, 2K, or 4K (4K requires a compatible --model)
   --background <mode>    auto, opaque, or transparent (PNG)
   -h, --help             Show command help`,
-  music: `Usage: orgen music ("<prompt>" | --prompt-file <path>) -o <path> [options]
+  music: `Usage: orgen music ("<prompt>" | --prompt-file <path> | --batch <path>) [options]
 
-  -o, --output <path>     Destination path for the MP3
+  -o, --output <path>    Destination for one MP3 (default: generated name in current directory)
   --prompt-file <path>   Read the prompt from a UTF-8 file
+  --batch <path>         Generate one track per job in a JSON manifest
   --json                 Print path, model, and cost as JSON
   --full                 Generate a full track (default: 30-second clip)
   -h, --help             Show command help`,
-  auth: `Usage: orgen auth <set|clear>
+  auth: `Usage: orgen auth <set|clear|status>
 
-  set    Save or replace the OpenRouter API key in Windows Credential Manager
-  clear  Remove the saved key`,
+  set     Save or replace the OpenRouter API key in Windows Credential Manager
+  clear   Remove the saved key
+  status  Show which credential source orgen would use`,
 };
 const generationOptions = {
   image: {
@@ -53,6 +59,7 @@ const generationOptions = {
     'aspect-ratio': { type: 'string' },
     resolution: { type: 'string' },
     background: { type: 'string' },
+    reference: { type: 'string' },
   },
   music: { ...commonOptions, full: { type: 'boolean' } },
 };
@@ -60,17 +67,48 @@ const generationOptions = {
 async function readPrompt(positionals, promptFile) {
   if (promptFile !== undefined) {
     if (positionals.length) throw new Error('Use either a text prompt or --prompt-file.');
-    if (!promptFile.trim()) throw new Error('Provide a file path with --prompt-file.');
+    if (typeof promptFile !== 'string' || !promptFile.trim()) {
+      throw new Error('Provide a prompt file path.');
+    }
     const prompt = (await readFile(promptFile, 'utf8')).replace(/^\uFEFF/, '');
     if (!prompt.trim()) throw new Error('The prompt file is empty.');
     return prompt;
   }
 
   const [prompt] = positionals;
-  if (positionals.length !== 1 || !prompt.trim()) {
+  if (positionals.length !== 1 || typeof prompt !== 'string' || !prompt.trim()) {
     throw new Error('Provide exactly one quoted text prompt or use --prompt-file.');
   }
   return prompt;
+}
+
+async function readBatch(path, command, background) {
+  if (!path.trim()) throw new Error('Provide a manifest path with --batch.');
+  const text = await readFile(path, 'utf8');
+  let entries;
+  try {
+    entries = JSON.parse(text.replace(/^\uFEFF/, ''));
+  } catch {
+    throw new Error('The batch manifest must contain valid JSON.');
+  }
+  if (!Array.isArray(entries) || !entries.length) {
+    throw new Error('The batch manifest must be a nonempty JSON array.');
+  }
+
+  const jobs = [];
+  for (const [offset, entry] of entries.entries()) {
+    try {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+          Object.keys(entry).some((key) => !['prompt', 'promptFile', 'output'].includes(key))) {
+        throw new Error('Use a job object with prompt or promptFile and an optional output.');
+      }
+      const prompt = await readPrompt(Object.hasOwn(entry, 'prompt') ? [entry.prompt] : [], entry.promptFile);
+      jobs.push(prepareJob(command, prompt, entry.output, background));
+    } catch (error) {
+      throw new Error(`Batch job ${offset + 1}: ${error.message}`);
+    }
+  }
+  return jobs;
 }
 
 async function promptForKey(input, output) {
@@ -105,7 +143,25 @@ function pathForMedia(path, mediaType) {
   return extension ? path : path + allowed[0];
 }
 
+function prepareJob(command, prompt, output, background) {
+  if (output !== undefined &&
+      (typeof output !== 'string' || !output.trim() || /[\\/]$/.test(output))) {
+    throw new Error('Provide a valid output file path.');
+  }
+  const path = resolve(output ?? `${command}-${randomUUID()}`);
+  let preflightPath;
+  if (command === 'music') {
+    preflightPath = pathForMedia(path, 'audio/mpeg');
+  } else if (background === 'transparent') {
+    preflightPath = pathForMedia(path, 'image/png');
+  } else if (extname(path)) {
+    preflightPath = path;
+  }
+  return { prompt, path, preflightPath };
+}
+
 async function checkOutputAvailable(path) {
+  if (!path) return;
   try {
     await lstat(path);
   } catch (error) {
@@ -130,6 +186,56 @@ async function saveOutput(path, bytes) {
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+async function resolveCredential(env, credentials) {
+  const override = env.OPENROUTER_API_KEY?.trim();
+  if (override) return { key: override, source: 'OPENROUTER_API_KEY' };
+  const stored = (await credentials.get())?.trim();
+  if (stored) return { key: stored, source: 'Windows Credential Manager' };
+  throw new Error('OpenRouter API key missing. Run orgen auth set or set OPENROUTER_API_KEY.');
+}
+
+function formatCost(costUsd) {
+  return costUsd === null ? 'unavailable' : usd.format(costUsd);
+}
+
+async function generateAndSave(job, generate, recordCost) {
+  const { bytes, mediaType, model, costUsd } = await generate(job.prompt);
+  recordCost(costUsd);
+  const path = pathForMedia(job.path, mediaType);
+  await saveOutput(path, bytes);
+  return { path, model, costUsd };
+}
+
+async function runBatch(jobs, generate, { json, output, errorOutput }) {
+  const results = [];
+  let failures = 0;
+  for (const [offset, job] of jobs.entries()) {
+    const index = offset + 1;
+    let costUsd = null;
+    try {
+      await checkOutputAvailable(job.preflightPath);
+      const result = await generateAndSave(job, generate, (cost) => {
+        costUsd = cost;
+        if (!json) errorOutput.write(`Job ${index} cost: ${formatCost(cost)}\n`);
+      });
+      results.push({ index, ...result });
+      if (!json) output.write(result.path + '\n');
+    } catch (error) {
+      failures += 1;
+      results.push({ index, error: error.message, costUsd });
+      if (!json) errorOutput.write(`Job ${index}: ${error.message}\n`);
+    }
+  }
+  // Remove floating-point addition noise before displaying the USD subtotal.
+  const knownCostUsd = Number(results.reduce((sum, result) => sum + (result.costUsd ?? 0), 0).toPrecision(15));
+  if (json) {
+    output.write(JSON.stringify({ results, knownCostUsd }) + '\n');
+  } else {
+    errorOutput.write(`Batch: ${jobs.length - failures} saved, ${failures} failed. Known cost: ${usd.format(knownCostUsd)}.\n`);
+  }
+  return failures ? 1 : 0;
 }
 
 export async function run(argv, {
@@ -158,8 +264,11 @@ export async function run(argv, {
       } else if (args.length === 1 && args[0] === 'clear') {
         await credentials.clear();
         output.write('Saved OpenRouter API key removed.\n');
+      } else if (args.length === 1 && args[0] === 'status') {
+        const { source } = await resolveCredential(env, credentials);
+        output.write(`OpenRouter API key source: ${source}\n`);
       } else {
-        throw new Error('Use orgen auth set or orgen auth clear.');
+        throw new Error('Use orgen auth set, clear, or status.');
       }
       return 0;
     }
@@ -174,9 +283,9 @@ export async function run(argv, {
       output.write(help[command] + '\n');
       return 0;
     }
-    const prompt = await readPrompt(positionals, values['prompt-file']);
-    if (!values.output?.trim() || /[\\/]$/.test(values.output)) {
-      throw new Error('Provide a file path with -o or --output.');
+    const batch = values.batch !== undefined;
+    if (batch && (positionals.length || values['prompt-file'] !== undefined || values.output !== undefined)) {
+      throw new Error('Use --batch by itself for prompts and output paths. Set them in the manifest.');
     }
 
     const imageOptions = {
@@ -185,30 +294,37 @@ export async function run(argv, {
       aspectRatio: values['aspect-ratio'],
       background: values.background,
     };
-    if (command === 'image') validateImageOptions(imageOptions);
-
-    const path = resolve(values.output);
-    if (command === 'music') {
-      await checkOutputAvailable(pathForMedia(path, 'audio/mpeg'));
-    } else if (imageOptions.background === 'transparent') {
-      await checkOutputAvailable(pathForMedia(path, 'image/png'));
-    } else if (extname(path)) {
-      await checkOutputAvailable(path);
+    if (command === 'image') {
+      validateImageOptions(imageOptions);
+      if (values.reference !== undefined) {
+        if (!values.reference.trim()) throw new Error('Provide a file path with --reference.');
+        imageOptions.referenceImage = await readFile(values.reference);
+        referenceImageType(imageOptions.referenceImage);
+      }
     }
 
-    const key = env.OPENROUTER_API_KEY?.trim() || (await credentials.get())?.trim();
-    if (!key) throw new Error('OpenRouter API key missing. Run orgen auth set or set OPENROUTER_API_KEY.');
+    let jobs;
+    if (batch) {
+      jobs = await readBatch(values.batch, command, values.background);
+    } else {
+      const prompt = await readPrompt(positionals, values['prompt-file']);
+      const job = prepareJob(command, prompt, values.output, values.background);
+      await checkOutputAvailable(job.preflightPath);
+      jobs = [job];
+    }
+    const { key } = await resolveCredential(env, credentials);
     const client = createClient({ apiKey: key, fetchImpl });
-    const { bytes, mediaType, model, costUsd } = command === 'image'
-      ? await client.generateImage({ prompt, ...imageOptions })
-      : await client.generateMusic({ prompt, full: values.full });
-    if (!values.json) {
-      errorOutput.write(`Cost: ${costUsd === null ? 'unavailable' : usd.format(costUsd)}\n`);
+    const generate = command === 'image'
+      ? (prompt) => client.generateImage({ prompt, ...imageOptions })
+      : (prompt) => client.generateMusic({ prompt, full: values.full });
+    if (batch) {
+      return await runBatch(jobs, generate, { json: values.json, output, errorOutput });
     }
-    const destination = pathForMedia(path, mediaType);
-    await saveOutput(destination, bytes);
-    const result = values.json ? JSON.stringify({ path: destination, model, costUsd }) : destination;
-    output.write(result + '\n');
+
+    const result = await generateAndSave(jobs[0], generate, (cost) => {
+      if (!values.json) errorOutput.write(`Cost: ${formatCost(cost)}\n`);
+    });
+    output.write((values.json ? JSON.stringify(result) : result.path) + '\n');
     return 0;
   } catch (error) {
     errorOutput.write(`orgen: ${error.message}\n`);

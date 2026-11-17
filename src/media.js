@@ -34,6 +34,16 @@ function sniffImageType(bytes) {
   if (['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6))) return 'image/gif';
 }
 
+export function referenceImageType(bytes) {
+  if (!(bytes instanceof Uint8Array)) throw new Error('Provide the reference image as bytes.');
+  const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const mediaType = sniffImageType(buffer);
+  if (mediaType === 'image/png' || mediaType === 'image/jpeg' || mediaType === 'image/webp') {
+    return mediaType;
+  }
+  throw new Error('The reference image must be a PNG, JPEG, or WebP file.');
+}
+
 export function imageMediaType(bytes, reportedType, transparent) {
   const detectedType = sniffImageType(bytes);
   const mediaType = reportedType ?? detectedType;

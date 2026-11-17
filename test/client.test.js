@@ -63,6 +63,28 @@ test('4K requires an explicit compatible image model', async () => {
   });
 });
 
+test('image references are encoded from bytes and invalid formats fail before a request', async () => {
+  let requests = 0;
+  const client = createClient({
+    apiKey: 'test-key',
+    async fetchImpl(_url, options) {
+      requests += 1;
+      assert.deepEqual(JSON.parse(options.body).input_references, [{
+        type: 'image_url',
+        image_url: { url: `data:image/png;base64,${png.toString('base64')}` },
+      }]);
+      return Response.json({ data: [{ b64_json: png.toString('base64') }] });
+    },
+  });
+  await assert.rejects(
+    client.generateImage({ prompt: 'Fox', referenceImage: Buffer.from('not an image') }),
+    /reference image must be a PNG/,
+  );
+  assert.equal(requests, 0);
+  await client.generateImage({ prompt: 'Fox', referenceImage: new Uint8Array(png) });
+  assert.equal(requests, 1);
+});
+
 test('image errors and invalid media are actionable and do not expose the API key', async () => {
   const apiKey = 'test-key';
   for (const [response, expected] of [

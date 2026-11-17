@@ -1,0 +1,21 @@
+{
+  "name": "orgen",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Generate images and music from the command line with OpenRouter.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "orgen": "./bin/orgen.js"
+  },
+  "exports": "./src/client.js",
+  "files": [
+    "bin",
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test --test-isolation=none"
+  }
+}

@@ -23,16 +23,26 @@ orgen music "Cinematic piano and strings" --full -o assets/theme.mp3
 - Use an explicit compatible model for 4K. For example, add `--resolution 4K --model sourceful/riverflow-v2.6-pro` to the transparent fox command and choose a fresh output path. [Riverflow capabilities](https://openrouter.ai/api/v1/images/models/sourceful/riverflow-v2.6-pro/endpoints)
 - Music defaults to a [30-second Lyria 3 Clip](https://openrouter.ai/google/lyria-3-clip-preview). `--full` generates a full track with [Lyria 3 Pro](https://openrouter.ai/google/lyria-3-pro-preview).
 - Use `-o` or `--output` to choose the destination. For an image in the model's default format, omit the extension and let `orgen` add it. `orgen` creates missing directories, refuses to overwrite existing files, and prints the absolute path on success.
+- The saved path goes to stdout. The generation cost reported by OpenRouter goes to stderr in USD, or appears as `Cost: unavailable` when the response has no cost.
+
+Both commands accept `--prompt-file <path>` for a UTF-8 prompt file. Supply either a file or a quoted prompt. To get a machine-readable result, use `--json`.
+
+```sh
+orgen image --prompt-file prompts/fox.txt --background transparent -o assets/fox.png --json
+orgen music --prompt-file prompts/loop.txt -o assets/loop.mp3 --json
+```
+
+JSON mode writes one object to stdout with the absolute `path`, the `model` reported by OpenRouter (or the requested model), and `costUsd` as a number or `null` if unavailable. Errors go to stderr.
 
 ## Use from Node.js
 
-Link the package into your other Node.js project with `npm link orgen`. The client returns a `Buffer` and its MIME type.
+Link the package into your other Node.js project with `npm link orgen`. The client returns a `Buffer`, its MIME type, the model, and `costUsd`, which is `null` when OpenRouter omits the cost.
 
 ```js
 import { createClient } from 'orgen';
 
 const client = createClient({ apiKey: process.env.OPENROUTER_API_KEY });
-const { bytes, mediaType } = await client.generateImage({
+const { bytes, mediaType, model, costUsd } = await client.generateImage({
   prompt: 'Watercolor fox icon',
   background: 'transparent',
 });
@@ -41,4 +51,4 @@ const { bytes, mediaType } = await client.generateImage({
 ## Verify locally
 
 - Run `npm test` for offline tests. From a regular WSL terminal, run `ORGEN_TEST_WINDOWS_KEYCHAIN=1 npm test` to also verify the real keychain using a temporary credential.
-- For a live smoke test after saving your key, run the first three generation examples with fresh output paths. Open the first image, confirm the fox PNG has a transparent background, and play the MP3 to confirm it is a 30-second clip. These calls use OpenRouter credits.
+- For a live smoke test after saving your key, run the first three generation examples with fresh output paths. Check the reported cost, open the first image, confirm the fox PNG has a transparent background, and play the MP3 to confirm it is a 30-second clip. These calls use OpenRouter credits.

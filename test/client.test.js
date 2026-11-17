@@ -35,13 +35,16 @@ test('images send Seedream options and request one PNG for transparency', async 
         background: 'transparent',
         output_format: 'png',
       });
-      return Response.json({ data: [{ b64_json: png.toString('base64') }] });
+      return Response.json({
+        data: [{ b64_json: png.toString('base64') }],
+        usage: { cost: 0.035 },
+      });
     },
   });
 
   assert.deepEqual(await client.generateImage({
     prompt: 'Fox', aspectRatio: '1:1', resolution: '1.5K', background: 'transparent',
-  }), { bytes: png, mediaType: 'image/png' });
+  }), { bytes: png, mediaType: 'image/png', model: 'bytedance-seed/seedream-5-5', costUsd: 0.035 });
 });
 
 test('4K requires an explicit compatible image model', async () => {
@@ -80,7 +83,8 @@ test('image errors and invalid media are actionable and do not expose the API ke
 test('both music modes decode base64 fragments split across SSE events and transport chunks', async () => {
   const base64 = mp3.toString('base64');
   const events = ': OPENROUTER PROCESSING\r\n\r\n' +
-    audioEvent(base64.slice(0, 5)) + audioEvent(base64.slice(5)) + 'data: [DONE]\r\n\r\n';
+    audioEvent(base64.slice(0, 5)) + audioEvent(base64.slice(5)) +
+    'data: {"choices":[],"usage":{"cost":0.04}}\r\n\r\ndata: [DONE]\r\n\r\n';
   const models = ['google/lyria-3-clip-preview', 'google/lyria-3-pro-preview'];
   const client = createClient({
     apiKey: 'test-key',
@@ -96,8 +100,13 @@ test('both music modes decode base64 fragments split across SSE events and trans
       return streamResponse(...events.match(/[\s\S]{1,13}/g));
     },
   });
-  assert.deepEqual(await client.generateMusic({ prompt: 'Piano' }), { bytes: mp3, mediaType: 'audio/mpeg' });
-  assert.deepEqual(await client.generateMusic({ prompt: 'Piano', full: true }), { bytes: mp3, mediaType: 'audio/mpeg' });
+  const expected = { bytes: mp3, mediaType: 'audio/mpeg', costUsd: 0.04 };
+  assert.deepEqual(await client.generateMusic({ prompt: 'Piano' }), {
+    ...expected, model: 'google/lyria-3-clip-preview',
+  });
+  assert.deepEqual(await client.generateMusic({ prompt: 'Piano', full: true }), {
+    ...expected, model: 'google/lyria-3-pro-preview',
+  });
 });
 
 test('music rejects truncated, failed, and invalid audio streams', async () => {

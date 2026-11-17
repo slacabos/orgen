@@ -1,4 +1,4 @@
-import { link, lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
@@ -7,8 +7,15 @@ import { createClient, validateImageOptions } from './client.js';
 import { mediaExtensions } from './media.js';
 import { createCredentialStore } from './windows-credentials.js';
 
-const helpOption = { type: 'boolean', short: 'h' };
-const outputOption = { type: 'string', short: 'o' };
+const commonOptions = {
+  help: { type: 'boolean', short: 'h' },
+  output: { type: 'string', short: 'o' },
+  json: { type: 'boolean' },
+  'prompt-file': { type: 'string' },
+};
+const usd = new Intl.NumberFormat('en-US', {
+  style: 'currency', currency: 'USD', maximumFractionDigits: 20,
+});
 const help = {
   main: `Usage: orgen <command> [options]
 
@@ -17,17 +24,21 @@ const help = {
   auth     Manage the saved OpenRouter API key
 
 Run orgen <command> --help for options.`,
-  image: `Usage: orgen image "<prompt>" -o <path> [options]
+  image: `Usage: orgen image ("<prompt>" | --prompt-file <path>) -o <path> [options]
 
   -o, --output <path>     Destination path
+  --prompt-file <path>   Read the prompt from a UTF-8 file
+  --json                 Print path, model, and cost as JSON
   --model <id>           OpenRouter image model (default: bytedance-seed/seedream-5-5)
   --aspect-ratio <ratio> Aspect ratio, for example 16:9
   --resolution <tier>    1K, 1.5K, 2K, or 4K (4K requires a compatible --model)
   --background <mode>    auto, opaque, or transparent (PNG)
   -h, --help             Show command help`,
-  music: `Usage: orgen music "<prompt>" -o <path> [options]
+  music: `Usage: orgen music ("<prompt>" | --prompt-file <path>) -o <path> [options]
 
   -o, --output <path>     Destination path for the MP3
+  --prompt-file <path>   Read the prompt from a UTF-8 file
+  --json                 Print path, model, and cost as JSON
   --full                 Generate a full track (default: 30-second clip)
   -h, --help             Show command help`,
   auth: `Usage: orgen auth <set|clear>
@@ -37,15 +48,30 @@ Run orgen <command> --help for options.`,
 };
 const generationOptions = {
   image: {
-    help: helpOption,
-    output: outputOption,
+    ...commonOptions,
     model: { type: 'string' },
     'aspect-ratio': { type: 'string' },
     resolution: { type: 'string' },
     background: { type: 'string' },
   },
-  music: { help: helpOption, output: outputOption, full: { type: 'boolean' } },
+  music: { ...commonOptions, full: { type: 'boolean' } },
 };
+
+async function readPrompt(positionals, promptFile) {
+  if (promptFile !== undefined) {
+    if (positionals.length) throw new Error('Use either a text prompt or --prompt-file.');
+    if (!promptFile.trim()) throw new Error('Provide a file path with --prompt-file.');
+    const prompt = (await readFile(promptFile, 'utf8')).replace(/^\uFEFF/, '');
+    if (!prompt.trim()) throw new Error('The prompt file is empty.');
+    return prompt;
+  }
+
+  const [prompt] = positionals;
+  if (positionals.length !== 1 || !prompt.trim()) {
+    throw new Error('Provide exactly one quoted text prompt or use --prompt-file.');
+  }
+  return prompt;
+}
 
 async function promptForKey(input, output) {
   if (!input.isTTY) throw new Error('Run orgen auth set in an interactive terminal.');
@@ -148,10 +174,7 @@ export async function run(argv, {
       output.write(help[command] + '\n');
       return 0;
     }
-    const [prompt] = positionals;
-    if (positionals.length !== 1 || !prompt.trim()) {
-      throw new Error('Provide exactly one quoted text prompt.');
-    }
+    const prompt = await readPrompt(positionals, values['prompt-file']);
     if (!values.output?.trim() || /[\\/]$/.test(values.output)) {
       throw new Error('Provide a file path with -o or --output.');
     }
@@ -176,12 +199,16 @@ export async function run(argv, {
     const key = env.OPENROUTER_API_KEY?.trim() || (await credentials.get())?.trim();
     if (!key) throw new Error('OpenRouter API key missing. Run orgen auth set or set OPENROUTER_API_KEY.');
     const client = createClient({ apiKey: key, fetchImpl });
-    const { bytes, mediaType } = command === 'image'
+    const { bytes, mediaType, model, costUsd } = command === 'image'
       ? await client.generateImage({ prompt, ...imageOptions })
       : await client.generateMusic({ prompt, full: values.full });
+    if (!values.json) {
+      errorOutput.write(`Cost: ${costUsd === null ? 'unavailable' : usd.format(costUsd)}\n`);
+    }
     const destination = pathForMedia(path, mediaType);
     await saveOutput(destination, bytes);
-    output.write(destination + '\n');
+    const result = values.json ? JSON.stringify({ path: destination, model, costUsd }) : destination;
+    output.write(result + '\n');
     return 0;
   } catch (error) {
     errorOutput.write(`orgen: ${error.message}\n`);

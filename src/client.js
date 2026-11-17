@@ -51,14 +51,16 @@ async function* sseData(body) {
   if (data.length) yield data.join('\n');
 }
 
-async function readMusic(response, apiKey) {
+async function readMusic(response, apiKey, requestedModel) {
   const fragments = [];
+  let model = requestedModel;
+  let costUsd = null;
   for await (const event of sseData(response.body)) {
     if (!event) continue;
     if (event === '[DONE]') {
       const bytes = decodeBase64(fragments.join(''), 'audio');
       validateMp3(bytes);
-      return { bytes, mediaType: 'audio/mpeg' };
+      return { bytes, mediaType: 'audio/mpeg', model, costUsd };
     }
     let chunk;
     try {
@@ -71,6 +73,9 @@ async function readMusic(response, apiKey) {
       const message = providerError((chunk.error ?? choice?.error)?.message, apiKey);
       throw new Error(message ? `OpenRouter audio generation failed. ${message}` : 'OpenRouter audio generation failed.');
     }
+    const cost = chunk?.usage?.cost;
+    if (Number.isFinite(cost)) costUsd = cost;
+    if (typeof chunk?.model === 'string' && chunk.model.trim()) model = chunk.model;
     const fragment = choice?.delta?.audio?.data;
     if (typeof fragment === 'string') fragments.push(fragment);
   }
@@ -133,19 +138,26 @@ export function createClient({ apiKey, fetchImpl = fetch } = {}) {
         }
         const image = result?.data?.[0];
         const bytes = decodeBase64(image?.b64_json, 'image');
-        return { bytes, mediaType: imageMediaType(bytes, image.media_type, transparent) };
+        const cost = result.usage?.cost;
+        return {
+          bytes,
+          mediaType: imageMediaType(bytes, image.media_type, transparent),
+          model: typeof result.model === 'string' && result.model.trim() ? result.model : model,
+          costUsd: Number.isFinite(cost) ? cost : null,
+        };
       });
     },
 
     async generateMusic({ prompt, full = false }) {
       validatePrompt(prompt);
+      const model = full ? fullModel : clipModel;
       return request('chat/completions', {
-        model: full ? fullModel : clipModel,
+        model,
         messages: [{ role: 'user', content: prompt }],
         modalities: ['text', 'audio'],
         audio: { format: 'mp3' },
         stream: true,
-      }, (response) => readMusic(response, key));
+      }, (response) => readMusic(response, key, model));
     },
   };
 }

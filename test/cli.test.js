@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -28,6 +28,8 @@ test('help and input errors run before accessing credentials', async () => {
   assert.match((await cli(['--help'], { credentials })).stdout, /Usage: orgen/);
   assert.match((await cli(['image', '--help'], { credentials })).stdout, /--background/);
   assert.match((await cli(['music', '--help'], { credentials })).stdout, /--full/);
+  assert.match((await cli(['image', '--help'], { credentials })).stdout, /--prompt-file/);
+  assert.match((await cli(['music', '--help'], { credentials })).stdout, /--json/);
   assert.match((await cli(['auth', '--help'], { credentials })).stdout, /auth <set\|clear>/);
   for (const [args, expected] of [
     [['music', 'Tune', '--model', 'other', '-o', 'test.mp3'], /--model/],
@@ -78,9 +80,10 @@ test('CLI saves the returned bytes atomically and uses the requested credential 
   const root = await mkdtemp(join(tmpdir(), 'orgen-cli-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const folder = join(root, 'assets');
-  const imageResponse = () => Response.json({ data: [
-    { b64_json: png.toString('base64'), media_type: 'image/png' },
-  ] });
+  const imageResponse = (cost) => Response.json({
+    data: [{ b64_json: png.toString('base64'), media_type: 'image/png' }],
+    usage: cost === undefined ? undefined : { cost },
+  });
 
   const output = join(folder, 'fox');
   const first = await cli(['image', 'Fox', '-o', output], {
@@ -88,10 +91,10 @@ test('CLI saves the returned bytes atomically and uses the requested credential 
     credentials: { get() { assert.fail('Environment key should take precedence'); } },
     async fetchImpl(_url, options) {
       assert.equal(options.headers.Authorization, 'Bearer env-key');
-      return imageResponse();
+      return imageResponse(0.0035);
     },
   });
-  assert.deepEqual(first, { code: 0, stdout: output + '.png\n', stderr: '' });
+  assert.deepEqual(first, { code: 0, stdout: output + '.png\n', stderr: 'Cost: $0.0035\n' });
   assert.deepEqual(await readFile(output + '.png'), png);
 
   const next = await cli(['image', 'Bear', '--output', join(folder, 'bear.png')], {
@@ -102,6 +105,7 @@ test('CLI saves the returned bytes atomically and uses the requested credential 
     },
   });
   assert.equal(next.code, 0);
+  assert.equal(next.stderr, 'Cost: unavailable\n');
 
   const existing = await cli(['image', 'Fox', '-o', output + '.png'], {
     credentials: { get() { assert.fail('Existing output should fail before generation'); } },
@@ -122,7 +126,7 @@ test('CLI saves the returned bytes atomically and uses the requested credential 
   assert.deepEqual((await readdir(folder)).sort(), ['bear.png', 'fox.png', 'race.png']);
 });
 
-test('music --full writes an MP3 and prints the saved path', async (t) => {
+test('music --full prints the saved path and reports the final cost, including zero', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'orgen-music-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const mp3 = Buffer.alloc(417);
@@ -133,11 +137,81 @@ test('music --full writes an MP3 and prints the saved path', async (t) => {
     async fetchImpl(_url, options) {
       assert.equal(JSON.parse(options.body).model, 'google/lyria-3-pro-preview');
       const event = { choices: [{ delta: { audio: { data: mp3.toString('base64') } } }] };
+      return new Response(
+        `data: ${JSON.stringify(event)}\n\ndata: {"choices":[],"usage":{"cost":0}}\n\ndata: [DONE]\n\n`,
+      );
+    },
+  });
+  assert.deepEqual(result, { code: 0, stdout: path + '.mp3\n', stderr: 'Cost: $0.00\n' });
+  assert.deepEqual(await readFile(path + '.mp3'), mp3);
+});
+
+test('image and music accept multiline prompt files and emit a single JSON result', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'orgen-prompts-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const promptFile = join(root, 'asset prompt.txt');
+  const prompt = 'Make it atmospheric.\r\nMood: café at sunrise.\r\n';
+  await writeFile(promptFile, '\uFEFF' + prompt);
+  const credentials = { get: async () => 'stored-key' };
+
+  const imagePath = join(root, 'fox.png');
+  const image = await cli(['image', '--prompt-file', promptFile, '--json', '-o', imagePath], {
+    credentials,
+    async fetchImpl(_url, options) {
+      assert.equal(JSON.parse(options.body).prompt, prompt);
+      return Response.json({
+        data: [{ b64_json: png.toString('base64') }],
+        usage: { cost: 0.035 },
+      });
+    },
+  });
+  assert.equal(image.code, 0, image.stderr);
+  assert.equal(image.stderr, '');
+  assert.deepEqual(JSON.parse(image.stdout), {
+    path: imagePath, model: 'bytedance-seed/seedream-5-5', costUsd: 0.035,
+  });
+  assert.deepEqual(await readFile(imagePath), png);
+
+  const mp3 = Buffer.alloc(417);
+  mp3.writeUInt32BE(0xfffb9064);
+  const musicPath = join(root, 'loop.mp3');
+  const music = await cli(['music', '--prompt-file', promptFile, '--json', '-o', musicPath], {
+    credentials,
+    async fetchImpl(_url, options) {
+      assert.equal(JSON.parse(options.body).messages[0].content, prompt);
+      const event = {
+        model: 'google/lyria-3-clip-preview-20260330',
+        choices: [{ delta: { audio: { data: mp3.toString('base64') } } }],
+      };
       return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`);
     },
   });
-  assert.deepEqual(result, { code: 0, stdout: path + '.mp3\n', stderr: '' });
-  assert.deepEqual(await readFile(path + '.mp3'), mp3);
+  assert.equal(music.code, 0, music.stderr);
+  assert.equal(music.stderr, '');
+  assert.deepEqual(JSON.parse(music.stdout), {
+    path: musicPath, model: 'google/lyria-3-clip-preview-20260330', costUsd: null,
+  });
+  assert.deepEqual(await readFile(musicPath), mp3);
+});
+
+test('prompt-file errors leave JSON stdout empty and fail before generation', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'orgen-empty-prompt-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const empty = join(root, 'empty.txt');
+  await writeFile(empty, ' \n\t');
+  const credentials = { get() { assert.fail('Unexpected credential lookup'); } };
+  for (const [args, expected] of [
+    [['Fox', '--prompt-file', empty], /either a text prompt or --prompt-file/],
+    [['--prompt-file', empty], /prompt file is empty/],
+    [['--prompt-file', join(root, 'missing.txt')], /missing\.txt/],
+    [[], /Provide exactly one quoted text prompt/],
+  ]) {
+    const result = await cli(['image', '--json', '-o', join(root, 'fox.png'), ...args], { credentials });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, expected);
+  }
+  assert.deepEqual(await readdir(root), ['empty.txt']);
 });
 
 test('Windows Credential Manager round trip', {

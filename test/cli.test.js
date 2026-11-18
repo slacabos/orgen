@@ -179,6 +179,33 @@ test('music --full prints the saved path and reports the final cost, including z
   assert.deepEqual(await readFile(path + '.mp3'), mp3);
 });
 
+test('music recitation appears in stderr and in batch JSON without saving audio', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'orgen-music-blocked-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const output = join(root, 'loop.mp3');
+  const manifest = join(root, 'jobs.json');
+  await writeFile(manifest, JSON.stringify([{ prompt: 'Piano', output }]));
+  const options = {
+    env: { OPENROUTER_API_KEY: 'test-key' },
+    fetchImpl: async () => new Response(
+      'data: {"choices":[{"finish_reason":"content_filter","native_finish_reason":"RECITATION"}]}\n\ndata: [DONE]\n\n',
+      { headers: { 'Content-Type': 'text/event-stream' } },
+    ),
+  };
+
+  const single = await cli(['music', 'Piano', '-o', output], options);
+  assert.equal(single.code, 1);
+  assert.equal(single.stdout, '');
+  assert.match(single.stderr, /^orgen: OpenRouter audio generation failed\. \[RECITATION\]/);
+
+  const batch = await cli(['music', '--batch', manifest, '--json'], options);
+  assert.equal(batch.code, 1);
+  const [failed] = JSON.parse(batch.stdout).results;
+  assert.match(failed.error, /\[RECITATION\]/);
+  assert.equal(failed.path, undefined);
+  assert.deepEqual(await readdir(root), ['jobs.json']);
+});
+
 test('image and music accept multiline prompt files and emit a single JSON result', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'orgen-prompts-'));
   t.after(() => rm(root, { recursive: true, force: true }));

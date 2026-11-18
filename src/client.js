@@ -31,6 +31,43 @@ function providerError(message, apiKey) {
     .slice(0, 300);
 }
 
+function mentionsRecitation(value) {
+  return typeof value === 'string' && /\brecitation\b/i.test(value);
+}
+
+function rawProviderRecitation(raw) {
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      return mentionsRecitation(raw);
+    }
+  }
+  return [
+    raw,
+    raw?.error?.code,
+    raw?.error?.message,
+    raw?.candidates?.[0]?.finishReason,
+    raw?.promptFeedback?.blockReason,
+  ].some(mentionsRecitation);
+}
+
+function providerErrorDetails(error, apiKey, choice) {
+  const reasons = [
+    choice?.native_finish_reason,
+    error?.metadata?.provider_code,
+    error?.code,
+    error?.metadata?.error_type,
+    choice?.finish_reason,
+  ];
+  const message = providerError(error?.message, apiKey);
+  const recitation = reasons.some(mentionsRecitation) || mentionsRecitation(error?.message) ||
+    rawProviderRecitation(error?.metadata?.raw);
+  const reason = recitation ? 'RECITATION' : reasons.find((value) =>
+    typeof value === 'string' && /^[a-z][a-z0-9_-]{0,63}$/i.test(value) && !/^(error|stop)$/i.test(value));
+  return [reason && `[${providerError(reason, apiKey)}]`, message].filter(Boolean).join(' ');
+}
+
 async function* sseData(body) {
   if (!body) throw new Error('OpenRouter returned no audio stream.');
   let pending = '';
@@ -69,9 +106,12 @@ async function readMusic(response, apiKey, requestedModel) {
       throw new Error('OpenRouter returned an invalid audio stream event.');
     }
     const choice = chunk?.choices?.[0];
-    if (chunk?.error || choice?.error || choice?.finish_reason === 'error') {
-      const message = providerError((chunk.error ?? choice?.error)?.message, apiKey);
-      throw new Error(message ? `OpenRouter audio generation failed. ${message}` : 'OpenRouter audio generation failed.');
+    const error = chunk?.error ?? choice?.error;
+    const finishReason = choice?.finish_reason;
+    if (error || finishReason === 'error' || finishReason === 'content_filter' ||
+        mentionsRecitation(finishReason) || mentionsRecitation(choice?.native_finish_reason)) {
+      const details = providerErrorDetails(error, apiKey, choice);
+      throw new Error(`OpenRouter audio generation failed.${details ? ` ${details}` : ''}`);
     }
     const cost = chunk?.usage?.cost;
     if (Number.isFinite(cost)) costUsd = cost;
@@ -104,8 +144,8 @@ export function createClient({ apiKey, fetchImpl = fetch } = {}) {
 
       if (!response.ok) {
         const result = await response.json().catch(() => {});
-        const message = providerError(result?.error?.message, key);
-        throw new Error(`OpenRouter returned HTTP ${response.status}.${message ? ` ${message}` : ''}`);
+        const details = providerErrorDetails(result?.error, key);
+        throw new Error(`OpenRouter returned HTTP ${response.status}.${details ? ` ${details}` : ''}`);
       }
       return await readResponse(response);
     } catch (error) {

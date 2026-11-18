@@ -142,3 +142,34 @@ test('music rejects truncated, failed, and invalid audio streams', async () => {
     await assert.rejects(client.generateMusic({ prompt: 'Piano' }), expected);
   }
 });
+
+test('music exposes recitation in finish reasons and provider errors', async () => {
+  const responses = [
+    streamResponse(
+      audioEvent(mp3.toString('base64')),
+      'data: {"choices":[{"finish_reason":"content_filter","native_finish_reason":"RECITATION"}]}\n\n',
+      'data: [DONE]\n\n',
+    ),
+    streamResponse('data: {"choices":[{"finish_reason":"RECITATION"}]}\n\n'),
+    streamResponse('data: {"error":{"message":"Provider returned error","metadata":{"provider_code":"recitation"}}}\n\n'),
+    Response.json({
+      error: { code: 'recitation', message: 'Request blocked. Credential: test-key' },
+    }, { status: 400 }),
+    Response.json({
+      error: {
+        code: 400,
+        message: 'Provider returned error',
+        metadata: { raw: JSON.stringify({ error: { code: 'recitation', input: 'private upstream detail' } }) },
+      },
+    }, { status: 400 }),
+  ];
+
+  for (const response of responses) {
+    const client = createClient({ apiKey: 'test-key', fetchImpl: async () => response });
+    await assert.rejects(client.generateMusic({ prompt: 'Piano' }), (error) => {
+      assert.match(error.message, /\[RECITATION\]/);
+      assert.doesNotMatch(error.message, /test-key|private upstream detail/);
+      return true;
+    });
+  }
+});
